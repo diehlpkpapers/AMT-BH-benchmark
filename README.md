@@ -1,1 +1,0 @@
-# AMT-BH-benchmark
