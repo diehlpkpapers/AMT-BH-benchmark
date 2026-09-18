@@ -1,0 +1,11 @@
+output/
+results/
+slurm/*.out
+*.vtu
+*.pvd
+.DS_Store
+
+# Generated datasets: too large for git (GitHub rejects >100 MB).
+# data/collision_4M.json regenerates them -- see README.
+data/*.pepcbin
+data/collision_4M*.csv
