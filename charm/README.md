@@ -22,16 +22,42 @@ distribution is rebalanced at every iteration rather than drifting over time.
 
 ## Building
 
-Requires a built Charm++ tree. No other dependencies — the geometry headers
-this code needs (`Vector3D.h`, `OrientedBox.h`) are self-contained here rather
-than pulled from the N-BodyShop `utility/structures` library.
+```shell
+./build.sh
+```
+
+That clones Charm++ into `./_deps/charm`, builds the
+`reconverse-<os>-<arch>` target for the machine it is run on, and then builds
+the benchmark against it. Charm++ is the only dependency: Reconverse and LCI
+are fetched by Charm++'s own CMake, and the geometry headers this code needs
+(`Vector3D.h`, `OrientedBox.h`) are self-contained here rather than pulled from
+the N-BodyShop `utility/structures` library. The result is three binaries:
+`barnes` (the simulation), and `plummer` / `gen` (input generators).
+
+The Reconverse targets are not on Charm++'s `main` branch yet, so `build.sh`
+clones the branch that carries them, `reconverse-specific-build`. Charm++ has
+`reconverse-darwin-arm8`, `reconverse-linux-arm8` and
+`reconverse-linux-x86_64`; `CHARM_TARGET` picks one explicitly if the guess
+from `uname` is wrong.
+
+To build against a Charm++ you already have, set `CHARM_PATH` to the target
+directory and no Charm++ is built:
+
+```shell
+CHARM_PATH=/path/to/charm/reconverse-<os>-<arch> ./build.sh
+```
+
+`build.sh` also takes `CHARM_SRC`, `CHARM_REPO`, `CHARM_BRANCH`, `CHARM_OPTS`,
+`JOBS` and `TRACE`; see the header of the script. The Charm++ tree is built
+once and reused, so a second `./build.sh` rebuilds only the benchmark.
+
+Underneath is a plain Makefile, which is the thing to reach for while editing:
 
 ```shell
 make CHARM_PATH=/path/to/charm/<target>
 ```
 
-`CHARM_PATH` defaults to `$HOME/charm_reconverse`. This produces three binaries:
-`barnes` (the simulation), and `plummer` / `gen` (input generators).
+`CHARM_PATH` defaults to `$HOME/charm_reconverse` there.
 
 ### Tracing
 
@@ -44,6 +70,8 @@ make TRACE=summary       # per-PE utilization over time (.sum)
 make TRACE=projections   # full event log per PE (.log.gz + .sts)
 make TRACE=none          # the default
 ```
+
+`build.sh` forwards it, so `TRACE=summary ./build.sh` does the same thing.
 
 Measured on 100k bodies, 20 steps, 4 PEs: 2.54 s untraced, 2.82 s with
 `summary` (+11%), 4.55 s with `projections` (+79%). Keep Projections runs
@@ -58,11 +86,33 @@ costs nothing.
 ## Running
 
 ```shell
+./run.sh
+```
+
+With no arguments that generates a 10k-particle input, then runs 10 steps on
+4 PEs. An input file and any further options are passed straight through, and
+the common knobs have environment variables:
+
+```shell
+./run.sh data.csv -ppc=2000        # the project's dataset
+PES=8 STEPS=100 ./run.sh           # wider and longer
+```
+
+`PES`, `PROCS`, `STEPS`, `NBODY`, `PPC`, `LEAF`, `THETA`, `DT`, `EPS`, `G`,
+`TIMERS`, `OUTPUT`, `OUTPUT_FREQ` and `LAUNCHER` are all read; anything left
+unset keeps the program's own default. `PROCS` x `PES` is the total PE count:
+under Reconverse the process count comes from the launcher and `+ppn` is the
+PE count within each. `run.sh` uses `srun` inside a Slurm allocation and LCI's
+`lcrun` otherwise, and `LAUNCHER` overrides that choice.
+
+The two steps underneath it are:
+
+```shell
 # Generate a 10k-particle input: two Plummer spheres offset along the diagonal
 ./plummer 10000 particles.csv csv
 
 # Run 10 steps on 4 PEs
-./barnes +p4 -in=particles.csv -killat=10
+./barnes +ppn 4 -in=particles.csv -killat=10
 ```
 
 `plummer` writes two half-populations offset from one another, so the result is
@@ -142,6 +192,17 @@ srun -n 8 --cpu-bind=none --unbuffered --kill-on-bad-exit=1 ./barnes \
 
 `--cpu-bind=none` matters: let `+pemap` do the pinning or Slurm's own binding
 fights it. `+showcpuaffinity` prints the resulting map if you want to check.
+
+`run.sh` will reach for `srun` by itself inside a Slurm allocation, but it does
+not guess at `+pemap` or at the fabric environment, so a run at this scale is
+either the command above or `run.sh` told exactly what to do:
+
+```shell
+export FI_CXI_RX_MATCH_MODE=hybrid
+PROCS=8 PES=15 LAUNCHER="srun -n 8 --cpu-bind=none --unbuffered --kill-on-bad-exit=1" \
+    ./run.sh data.csv -ppc=2000 -G=4.498626405128888e-15 -dtime=5000 -eps=0.1 \
+    +pemap 0-14,16-30,32-46,48-62,64-78,80-94,96-110,112-126 +lci_ndevices 2
+```
 
 One process per NUMA domain is worth the trouble. On 2M bodies over a full
 node it beats a single process holding all 120 PEs by 1.9x (0.447 against
