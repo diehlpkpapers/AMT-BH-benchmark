@@ -1,0 +1,50 @@
+{
+  "seed": 20260918,
+  "output": "collision_4M.csv",
+  "defaults": {
+    "mass": {
+      "particle_min": 0.03,
+      "particle_max": 20.0,
+      "black_hole_factor": 10.0
+    }
+  },
+  "galaxies": [
+    {
+      "name": "main",
+      "particles": 2080000,
+      "disk_radius": 60.0,
+      "disk_thickness": 5.0,
+      "position": [0.0, 0.0, 0.0],
+      "velocity": [0.0, 0.0, 0.0],
+      "disk_orientation": { "inclination": 10.0, "azimuth": 20.0 }
+    },
+    {
+      "name": "incoming",
+      "particles": 1280000,
+      "disk_radius": 40.0,
+      "disk_thickness": 4.0,
+      "orbit": {
+        "around": "main",
+        "mode": "crash",
+        "distance": 300.0,
+        "angle": 45.0,
+        "tangential_velocity_factor": 0.9,
+        "radial_velocity_factor": 0.8
+      },
+      "disk_orientation": { "inclination": 65.0, "azimuth": 140.0 }
+    },
+    {
+      "name": "satellite",
+      "particles": 640000,
+      "disk_radius": 20.0,
+      "disk_thickness": 2.0,
+      "orbit": {
+        "around": "main",
+        "mode": "stable",
+        "distance": 150.0,
+        "angle": 200.0
+      },
+      "disk_orientation": { "inclination": 30.0, "azimuth": 300.0 }
+    }
+  ]
+}
