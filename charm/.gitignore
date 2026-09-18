@@ -12,6 +12,12 @@ Makefile.dep
 # Records the TRACE= setting the current binary was linked with
 .tracemode
 
+# Charm++ cloned and built by build.sh
+_deps/
+
+# Records the Charm++ build that build.sh used, for run.sh to find
+.build.env
+
 # Build products
 barnes
 gen
