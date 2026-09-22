@@ -1,5 +1,6 @@
 #include "exchange.h"
 #include "morton_keys.h"
+#include <algorithm>
 #include <numeric>
 #include <stack>
 #include <iostream>
@@ -8,6 +9,17 @@
 
 void exchangeFullTrees(const OctreeMap &local_tree, OctreeMap &full_tree,
                           int rank, int size, hpxc::Ctx& ctx) {
+    // With a single locality there's no other rank to gather from - the
+    // merge loop below never runs its body (site == rank always), so
+    // serializing the whole tree and round-tripping it through all_gather
+    // would be pure waste. Same reasoning as update_rank_domains's size<=1
+    // early-return. Don't even copy into full_tree here: the caller uses
+    // my_tree directly instead of full_tree in this case (see main.cpp),
+    // so a copy would be just as wasted as the serialize/gather it replaces.
+    if (size <= 1) {
+        return;
+    }
+
     std::vector<NodeRecord> send_buf = serializeTreeToRecords(local_tree);
 
     std::vector<std::vector<NodeRecord>> per_site =
@@ -50,11 +62,15 @@ void exchangeEssentialTrees(
 
     int bucket_depth = bucket_bits/3;
 
-    // build per rank bucket AABBs with correct anisotropic dimensions
+    // Must match generateMortonCodes' normalization exactly (same L for all
+    // three axes) - otherwise a bucket key decodes to the wrong real-world
+    // box relative to the tree it's being tested against.
     std::vector<std::vector<BoundingBox>> bucket_boxes(size);
-    double dx   = global_bb.max.x - global_bb.min.x;
-    double dy   = global_bb.max.y - global_bb.min.y;
-    double dz   = global_bb.max.z - global_bb.min.z;
+    double dx_raw = global_bb.max.x - global_bb.min.x;
+    double dy_raw = global_bb.max.y - global_bb.min.y;
+    double dz_raw = global_bb.max.z - global_bb.min.z;
+    double L = std::max({dx_raw, dy_raw, dz_raw});
+    double dx = L, dy = L, dz = L;
 
     double cellX = dx / (1 << bucket_depth);
     double cellY = dy / (1 << bucket_depth);

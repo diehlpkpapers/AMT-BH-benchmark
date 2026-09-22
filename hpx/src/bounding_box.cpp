@@ -87,10 +87,14 @@ BoundingBox compute_global_bbox(const BoundingBox& local_bb, hpxc::Ctx& ctx) {
 
 BoundingBox getBoundingBoxForCell(const OctreeKey& k,
                                 const BoundingBox& global_bb) {
-    // Get the real world dimensions of the global box
-    double dx = global_bb.max.x - global_bb.min.x;
-    double dy = global_bb.max.y - global_bb.min.y;
-    double dz = global_bb.max.z - global_bb.min.z;
+    // Must match generateMortonCodes' normalization exactly (same L for all
+    // three axes, not each axis by its own extent) - otherwise a key decodes
+    // to a different box than the one it was actually built from.
+    double dx_raw = global_bb.max.x - global_bb.min.x;
+    double dy_raw = global_bb.max.y - global_bb.min.y;
+    double dz_raw = global_bb.max.z - global_bb.min.z;
+    double L = std::max({dx_raw, dy_raw, dz_raw});
+    double dx = L, dy = L, dz = L;
 
     // Calculate the real world size of a cell at this depth
     double sizeX = dx / (1 << k.depth);

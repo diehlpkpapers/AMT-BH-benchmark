@@ -588,11 +588,16 @@ void worker_main()
         }
         timers.stop(PhaseTimers::Phase::TreeExchange);
 
+        // At a single locality, exchangeFullTrees leaves full_tree untouched
+        // (nothing to gather/merge - see there), so FCPolicy::Tree must read
+        // my_tree directly instead.
+        const OctreeMap& tree_for_tree_policy = (size > 1) ? full_tree : my_tree;
+
         // 7. Compute new accelerations
         timers.start(PhaseTimers::Phase::Interact);
         switch (fcPol) {
             case FCPolicy::Tree:
-                computeAccelerations(full_tree, codes, local_pos, local_mass, theta, G, soft2, global_bb, local_acc);
+                computeAccelerations(tree_for_tree_policy, codes, local_pos, local_mass, theta, G, soft2, global_bb, local_acc);
                 break;
             case FCPolicy::LET:
                 computeAccelerationsWithLET(my_tree, remote_nodes, codes, local_pos, local_mass, theta, G, soft2, global_bb, local_acc, static_cast<int>(rank));
@@ -621,7 +626,7 @@ void worker_main()
             // FCPolicy::LET: computeAccelerationsWithLET() already merged the
             // remote pseudo-leaves into my_tree in place, so my_tree is the
             // same tree the force walk used - do NOT merge again.
-            const OctreeMap& energy_tree = (fcPol == FCPolicy::Tree) ? full_tree : my_tree;
+            const OctreeMap& energy_tree = (fcPol == FCPolicy::Tree) ? tree_for_tree_policy : my_tree;
 
             EnergySample e = computeGlobalEnergy(
                 fcPol, energy_exact, energy_tree, remote_nodes, codes,

@@ -70,9 +70,23 @@ std::vector<uint64_t> generateMortonCodes(const std::vector<Position>& raw, cons
     std::vector<uint64_t> out_codes(n);
     if (!n) return out_codes;
 
-    const double dx = (box.max.x == box.min.x) ? 1.0 : (box.max.x - box.min.x);
-    const double dy = (box.max.y == box.min.y) ? 1.0 : (box.max.y - box.min.y);
-    const double dz = (box.max.z == box.min.z) ? 1.0 : (box.max.z - box.min.z);
+    // Normalize all three axes by the SAME span (the longest one), not each
+    // axis by its own extent: the MAC (computeAccelerations/energy.cpp) uses
+    // side2[d] = (L/2^d)^2 for every axis, i.e. it already assumes a cell at
+    // depth d is a cube of side L/2^d. Normalizing per-axis instead would
+    // make a "cell" a real-world box (dx/2^d x dy/2^d x dz/2^d), and using
+    // max(dx,dy,dz) as if it were that box's edge length overstates the
+    // short axes' true extent on anisotropic data - opening cells the MAC
+    // didn't need to, i.e. a smaller effective theta than requested. This
+    // keeps the tree's actual geometry consistent with what the MAC assumes.
+    const double dx_raw = box.max.x - box.min.x;
+    const double dy_raw = box.max.y - box.min.y;
+    const double dz_raw = box.max.z - box.min.z;
+    const double L = std::max({dx_raw, dy_raw, dz_raw});
+    const double span = (L <= 0.0) ? 1.0 : L;
+    const double dx = span;
+    const double dy = span;
+    const double dz = span;
 
     constexpr uint32_t Q = (1u << 21);
 
