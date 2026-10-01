@@ -2,7 +2,7 @@
 
 julia_version = "1.12.7"
 manifest_format = "2.0"
-project_hash = "8a55a6c557d8cb7ea84b08f99df1d09dab76e21e"
+project_hash = "5d9df7ea7649c4bd8594ca3d85b73434610a2097"
 
 [[deps.AbstractTrees]]
 git-tree-sha1 = "2d9c9a55f9c93e8887ad391fbae72f8ef55e1177"
@@ -390,7 +390,7 @@ uuid = "a63ad114-7e13-5084-954f-fe012c677804"
 version = "1.11.0"
 
 [[deps.NBodyDagger]]
-deps = ["Dagger", "Distributed", "LinearAlgebra", "Printf", "Random", "Statistics", "TOML", "WriteVTK"]
+deps = ["Dagger", "Distributed", "LinearAlgebra", "Printf", "Random", "SIMD", "StaticArrays", "Statistics", "TOML", "WriteVTK"]
 path = "."
 uuid = "3f1b7e21-8c4d-4a6e-9b52-0d7a1c6e4f83"
 version = "0.1.0"
@@ -545,6 +545,12 @@ version = "3.0.8"
 [[deps.SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 version = "0.7.0"
+
+[[deps.SIMD]]
+deps = ["PrecompileTools"]
+git-tree-sha1 = "e24dc23107d426a096d3eae6c165b921e74c18e4"
+uuid = "fdea26ae-647d-5447-a871-4b548cad5224"
+version = "3.7.2"
 
 [[deps.ScopedValues]]
 deps = ["HashArrayMappedTries", "Logging"]

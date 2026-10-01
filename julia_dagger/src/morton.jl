@@ -71,11 +71,21 @@ Sentinel-prefixed Morton key of the cell of `level` that contains the point.
 @inline function morton_key(dom::Domain, x::Float64, y::Float64, z::Float64,
                             level::Int=MAX_LEVEL)
     ix, iy, iz = cell_index(dom, x, y, z, level)
-    key = ROOT_KEY
-    for l in (level - 1):-1:0
-        key = (key << 3) | UInt64(octant(ix, iy, iz, l))
-    end
-    return key
+    # One octant digit `4x + 2y + z` per level, most significant first: bit `l`
+    # of each coordinate lands at bit `3l` (+2, +1, +0).
+    return (ROOT_KEY << (3 * level)) | (_spread3(UInt64(ix)) << 2) |
+           (_spread3(UInt64(iy)) << 1) | _spread3(UInt64(iz))
+end
+
+"Bit `l` of the low 21 bits of `v`, moved to bit `3l`."
+@inline function _spread3(v::UInt64)
+    v &= 0x00000000001fffff
+    v = (v | (v << 32)) & 0x001f00000000ffff
+    v = (v | (v << 16)) & 0x001f0000ff0000ff
+    v = (v | (v << 8))  & 0x100f00f00f00f00f
+    v = (v | (v << 4))  & 0x10c30c30c30c30c3
+    v = (v | (v << 2))  & 0x1249249249249249
+    return v
 end
 
 "Level of a sentinel-prefixed key (the root is level 0)."

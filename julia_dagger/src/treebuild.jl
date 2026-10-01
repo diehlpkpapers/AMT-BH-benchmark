@@ -33,11 +33,12 @@ group_range(plan::TreePlan, k::Int) = plan.group_first[k]:(plan.group_first[k + 
 Descend until at least `target` cells are pending, leaving them as stubs.
 """
 function task_tree_plan(buf, meta, bs::Int, n::Int, dom::Domain,
-                        leaf_capacity::Int, max_depth::Int, target::Int)::TreePlan
+                        leaf_capacity::Int, max_depth::Int, target::Int,
+                        prev::Union{Nothing,Tree}=nothing)::TreePlan
     p = pfields(buf, bs, n)
     keys = mview(meta, bs, M_KEY, n)
     depth = min(max_depth, MAX_LEVEL)
-    t = Tree(dom)
+    t = recycle_tree(prev, dom)
     n == 0 && return TreePlan(t, TreeStub[])
     root = push_node!(t, ROOT_KEY, 0)
     target = max(1, target)
@@ -290,24 +291,38 @@ end
 """
     task_tree_count(buf, meta, bs, n, dom, leaf_capacity, max_depth, plan, k)
 
-Node count of every stub in subtree task `k`'s group, in group order.  Cheap
-next to the build -- one pass over the keys, no allocation and no writes -- and
-it is what lets the build skip the copy.
+`(nodes, children)` of every stub in subtree task `k`'s group, in group order:
+the size of its subtree, itself included, and the stub's own child count. The
+sizes let the build write straight into one array; the child counts place each
+subtree's child runs in `t.kids`.
 """
 function task_tree_count(buf, meta, bs::Int, n::Int, dom::Domain,
                          leaf_capacity::Int, max_depth::Int,
-                         plan::TreePlan, k::Int)::Vector{Int}
-    k > ngroups(plan) && return Int[]
+                         plan::TreePlan, k::Int)::Vector{NTuple{2,Int}}
+    k > ngroups(plan) && return NTuple{2,Int}[]
     keys = mview(meta, bs, M_KEY, n)
     depth = min(max_depth, MAX_LEVEL)
     r = group_range(plan, k)
-    out = Vector{Int}(undef, length(r))
+    out = Vector{NTuple{2,Int}}(undef, length(r))
     for (j, i) in enumerate(r)
         st = plan.stubs[i]
-        out[j] = _count_nodes(keys, st.lo, st.hi, Int(plan.upper.level[st.node]),
-                              leaf_capacity, depth)
+        level = Int(plan.upper.level[st.node])
+        # A stub is never a leaf, so its children are its non-empty octants.
+        out[j] = (_count_nodes(keys, st.lo, st.hi, level, leaf_capacity, depth),
+                  _octant_count(keys, st.lo, st.hi, 3 * (MAX_LEVEL - level - 1)))
     end
     return out
+end
+
+"""
+Where every stub's subtree goes: `node[i]` is the slot before stub `i`'s first
+descendant, `kid[i]` where their child runs start in `t.kids`, and `kid_upper`
+where the upper tree's runs end.
+"""
+struct TreeOffsets
+    node::Vector{Int}
+    kid::Vector{Int}
+    kid_upper::Int
 end
 
 """
@@ -315,12 +330,13 @@ end
 
 The upper tree grown to its final size, with every stub's slice reserved.
 """
-function task_tree_reserve(plan::TreePlan, off::Vector{Int}, counts::Vector{Int}...)::Tree
+function task_tree_reserve(plan::TreePlan, off::TreeOffsets,
+                           counts::Vector{NTuple{2,Int}}...)::Tree
     t = plan.upper
     isempty(plan.stubs) && return t
     flat = Int[]
-    for c in counts
-        append!(flat, c)
+    for c in counts, (nodes, _) in c
+        push!(flat, nodes)
     end
     length(flat) == length(plan.stubs) ||
         error("reserve got $(length(flat)) counts for $(length(plan.stubs)) stubs")
@@ -328,8 +344,12 @@ function task_tree_reserve(plan::TreePlan, off::Vector{Int}, counts::Vector{Int}
     # array whose length that would read.  It takes `off` as an argument so the
     # runtime orders it after `task_tree_offsets` -- both otherwise depend only
     # on the counts, so their order would be undefined.
-    total = off[end] + flat[end] - 1      # each root lands in its stub's own slot
+    total = off.node[end] + flat[end] - 1  # each root lands in its stub's own slot
     _grow_tree!(t, total)
+    # Packed by the fill tasks and `task_tree_finish!`; every node but the root
+    # is one node's child.
+    resize!(t.hot, total)
+    resize!(t.kids, total - 1)
     return t
 end
 
@@ -339,19 +359,54 @@ end
 Where each stub's extra nodes go, derived from the same counts in the same
 order as `task_tree_reserve`.
 """
-function task_tree_offsets(plan::TreePlan, counts::Vector{Int}...)::Vector{Int}
-    flat = Int[]
-    for c in counts
-        append!(flat, c)
+function task_tree_offsets(plan::TreePlan, counts::Vector{NTuple{2,Int}}...)::TreeOffsets
+    nodes = Int[]
+    kids = Int[]
+    for c in counts, (nd, ch) in c
+        push!(nodes, nd)
+        push!(kids, ch)
     end
-    off = Vector{Int}(undef, length(flat))
+    off = Vector{Int}(undef, length(nodes))
     at = nnodes(plan.upper)
-    for k in eachindex(flat)
+    for k in eachindex(nodes)
         off[k] = at
-        at += flat[k] - 1
+        at += nodes[k] - 1
     end
-    return off
+    # Child runs follow node order: first the upper tree, whose stubs get their
+    # children only when filled, then each subtree in stub order.
+    kup = 1
+    @inbounds for i in 1:nnodes(plan.upper)
+        kup += Int(plan.upper.nchild[i])
+    end
+    kup += sum(kids; init=0)
+    kid = Vector{Int}(undef, length(nodes))
+    at = kup
+    for k in eachindex(nodes)
+        kid[k] = at
+        at += (nodes[k] - 1) - kids[k]
+    end
+    return TreeOffsets(off, kid, kup)
 end
+
+"""
+    task_tree_layout(plan, counts...) -> (Tree, TreeOffsets)
+
+`task_tree_offsets` and `task_tree_reserve` in one task, in that order: one
+stage less in the graph for two steps that always run back to back.
+"""
+function task_tree_layout(plan::TreePlan, counts::Vector{NTuple{2,Int}}...)::Tuple{Tree,TreeOffsets}
+    off = task_tree_offsets(plan, counts...)
+    return (task_tree_reserve(plan, off, counts...), off)
+end
+
+"`task_tree_fill!` on the result of `task_tree_layout`."
+task_tree_fill_at!(layout::Tuple{Tree,TreeOffsets}, buf, meta, bs::Int, n::Int,
+                   leaf_capacity::Int, max_depth::Int, plan::TreePlan, k::Int)::Nothing =
+    task_tree_fill!(layout[1], buf, meta, bs, n, leaf_capacity, max_depth, plan, layout[2], k)
+
+"`task_tree_finish!` on the result of `task_tree_layout`."
+task_tree_finish_at!(layout::Tuple{Tree,TreeOffsets}, plan::TreePlan, fills...)::Tree =
+    task_tree_finish!(layout[1], plan, layout[2], fills...)
 
 """
     task_tree_fill!(tree, buf, meta, bs, n, leaf_capacity, max_depth, plan, off, k)
@@ -360,11 +415,12 @@ Build subtree task `k`'s stubs straight into `tree`.
 """
 function task_tree_fill!(tree::Tree, buf, meta, bs::Int, n::Int,
                          leaf_capacity::Int, max_depth::Int,
-                         plan::TreePlan, off::Vector{Int}, k::Int)::Nothing
+                         plan::TreePlan, offs::TreeOffsets, k::Int)::Nothing
     k > ngroups(plan) && return nothing
     p = pfields(buf, bs, n)
     keys = mview(meta, bs, M_KEY, n)
     depth = min(max_depth, MAX_LEVEL)
+    off = offs.node
     for i in group_range(plan, k)
         st = plan.stubs[i]
         # `off[i]` is the slot before this stub's first: the stub's own root stays
@@ -377,6 +433,11 @@ function task_tree_fill!(tree::Tree, buf, meta, bs::Int, n::Int,
         # that is silently wrong rather than an error.
         cur[] - 1 <= (i < length(plan.stubs) ? off[i + 1] : nnodes(tree)) ||
             error("subtree $i overran its slice: cursor $(cur[] - 1)")
+        # Pack the subtree here, while it is still in this core's cache.
+        next = _pack_range!(tree, off[i] + 1, cur[] - 1, offs.kid[i])
+        want = i < length(plan.stubs) ? offs.kid[i + 1] : length(tree.kids) + 1
+        next == want ||
+            error("subtree $i packed its child runs up to $(next - 1), expected $(want - 1)")
         last
     end
     return nothing
@@ -389,9 +450,15 @@ Mass and centre of mass for the nodes above the split, once every subtree is in
 place.  The `_fills` arguments carry no data; they are what makes this task wait
 for the writes.
 """
-function task_tree_finish!(tree::Tree, plan::TreePlan, _fills...)::Tree
-    isempty(plan.stubs) && return tree
+function task_tree_finish!(tree::Tree, plan::TreePlan, offs::TreeOffsets, _fills...)::Tree
+    isempty(plan.stubs) && return pack_hot!(tree)
     _propagate_com!(tree, 1, Set(st.node for st in plan.stubs))
+    # The fill tasks packed the subtrees; the upper nodes are packed here. Their
+    # count comes from the offsets, since `plan.upper` is `tree`, already grown.
+    nup = isempty(offs.node) ? nnodes(tree) : offs.node[1]
+    next = _pack_range!(tree, 1, nup, 1)
+    next == offs.kid_upper ||
+        error("upper tree packed its child runs up to $(next - 1), expected $(offs.kid_upper - 1)")
     return tree
 end
 

@@ -12,9 +12,20 @@ command -v "$JULIA" >/dev/null || { echo "julia not found; set JULIA=/path/to/ju
 # The MPI backend is an optional dependency: only added when asked for, so a
 # shared-memory build needs no MPI installation at all.
 if [ "${MPI:-0}" = "1" ]; then
-  "$JULIA" --project=. -e '
-      using Pkg; Pkg.add(name="MPI", version="0.20.27")
-      using MPIPreferences; MPIPreferences.use_system_binary()'
+  # MPIPreferences is what points MPI.jl at the system library, so it has to be
+  # in the environment as well.  The library is looked up in the MPI wrapper's
+  # own library directory too, which is not on the default search path for
+  # e.g. a Homebrew Open MPI; MPI_LIBDIR overrides it.
+  MPI_LIBDIR=${MPI_LIBDIR:-$(mpicc --showme:libdirs 2>/dev/null | awk '{print $1}' || true)}
+  if [ -z "$MPI_LIBDIR" ] && command -v mpiexec >/dev/null; then
+    MPI_LIBDIR=$(cd "$(dirname "$(command -v mpiexec)")/../lib" 2>/dev/null && pwd || true)
+  fi
+  MPI_LIBDIR="$MPI_LIBDIR" "$JULIA" --project=. -e '
+      using Pkg; Pkg.add([PackageSpec(name="MPI", version="0.20.27"),
+                          PackageSpec(name="MPIPreferences")])
+      using MPIPreferences
+      dir = get(ENV, "MPI_LIBDIR", "")
+      MPIPreferences.use_system_binary(; extra_paths = isempty(dir) ? String[] : [dir])'
 fi
 
 "$JULIA" --project=. -e 'using NBodyDagger' && echo "build ok"

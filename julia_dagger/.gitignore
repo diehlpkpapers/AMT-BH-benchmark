@@ -4,6 +4,8 @@ slurm/*.out
 *.vtu
 *.pvd
 .DS_Store
+# Written by `MPI=1 ./build.sh`: points MPI.jl at this machine's MPI.
+LocalPreferences.toml
 
 # Generated datasets: too large for git (GitHub rejects >100 MB).
 # data/collision_4M.json regenerates them -- see README.

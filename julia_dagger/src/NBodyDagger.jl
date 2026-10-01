@@ -7,6 +7,8 @@ Hybrid Barnes-Hut gravitational N-body solver in Julia, parallelised with
 module NBodyDagger
 
 using Dagger
+using StaticArrays
+import SIMD
 using Distributed
 using Printf
 using Random

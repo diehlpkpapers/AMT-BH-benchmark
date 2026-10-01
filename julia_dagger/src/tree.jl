@@ -49,6 +49,26 @@ end
 # tree
 # ---------------------------------------------------------------------------
 
+"""
+    HotNode
+
+The fields the force walk reads on its common path, packed into one 48-byte
+record: centre of mass, mass, level, child count and the two particle counts.
+Separate arrays would cost one cache line each per node visit. `kidfirst` points
+into `t.kids`, the node's children as one contiguous run.
+"""
+struct HotNode
+    comx::Float64
+    comy::Float64
+    comz::Float64
+    mass::Float64
+    lcount::Int32
+    icount::Int32
+    kidfirst::Int32
+    lev::Int8
+    nchild::Int8
+end
+
 mutable struct Tree
     dom::Domain
     key::Vector{UInt64}
@@ -69,12 +89,81 @@ mutable struct Tree
     ipz::Vector{Float64}
     ipm::Vector{Float64}
     ipid::Vector{UInt64}
+    hot::Vector{HotNode}          # packed accept-path fields; see `pack_hot!`
+    kids::Vector{Int32}           # present children, ascending octant, run per node
 end
 
 Tree(dom::Domain) = Tree(dom, UInt64[], Int8[], Float64[], Float64[], Float64[],
                          Float64[], Float64[], Int32[], Int8[], Int32[], Int32[],
                          Int32[], Int32[], Float64[], Float64[], Float64[],
-                         Float64[], UInt64[])
+                         Float64[], UInt64[], HotNode[], Int32[])
+
+"""
+    pack_hot!(t) -> Tree
+
+Fill `t.hot` and `t.kids` from the node arrays, once the tree is complete. The
+walk refuses a stale pack rather than read the wrong node.
+"""
+function pack_hot!(t::Tree)
+    n = nnodes(t)
+    length(t.hot) == n && return t
+    resize!(t.hot, n)
+    nk = 0
+    @inbounds for i in 1:n
+        nk += Int(t.nchild[i])
+    end
+    resize!(t.kids, nk)
+    _pack_range!(t, 1, n, 1)
+    return t
+end
+
+"""
+    _pack_range!(t, lo, hi, at) -> Int
+
+Pack nodes `lo:hi`, their child runs starting at `at` in `t.kids`; returns where
+the next node's run starts. A run starts after the children of every node
+numbered before it, so once that offset is known a range packs on its own --
+which is how the parallel build packs each subtree in the task that built it.
+"""
+function _pack_range!(t::Tree, lo::Int, hi::Int, at::Int)
+    @inbounds for i in lo:hi
+        nc = Int(t.nchild[i])
+        t.hot[i] = HotNode(t.comx[i], t.comy[i], t.comz[i], t.mass[i],
+                           t.lcount[i], t.icount[i], Int32(at),
+                           t.level[i], t.nchild[i])
+        w = at
+        for oct in 0:7
+            c = child(t, i, oct)
+            c == 0 && continue
+            t.kids[w] = c
+            w += 1
+        end
+        w == at + nc ||
+            error("node $i has nchild=$nc but a different count in childflat")
+        at = w
+    end
+    return at
+end
+
+"""
+    recycle_tree(prev, dom) -> Tree
+
+An empty tree over `dom`, reusing `prev`'s arrays if given. A 4M-particle tree
+is close to 1 GB; allocating it anew every step costs garbage collections and
+page faults. The driver passes the previous step's tree, which is no longer read
+by then, as a task argument.
+"""
+recycle_tree(::Nothing, dom::Domain) = Tree(dom)
+function recycle_tree(t::Tree, dom::Domain)
+    t.dom = dom
+    empty!(t.key); empty!(t.level); empty!(t.mass)
+    empty!(t.comx); empty!(t.comy); empty!(t.comz); empty!(t.size)
+    empty!(t.childflat); empty!(t.nchild)
+    empty!(t.lfirst); empty!(t.lcount); empty!(t.ifirst); empty!(t.icount)
+    empty!(t.ipx); empty!(t.ipy); empty!(t.ipz); empty!(t.ipm); empty!(t.ipid)
+    empty!(t.hot); empty!(t.kids)
+    return t
+end
 
 nnodes(t::Tree) = length(t.key)
 @inline child(t::Tree, node::Integer, oct::Integer) = t.childflat[8 * (node - 1) + oct + 1]
@@ -132,8 +221,9 @@ most `leaf_capacity` particles or `max_depth` is reached, so duplicate
 function build_local_tree(dom::Domain, keys::AbstractVector{UInt64},
                           x::AbstractVector{Float64}, y::AbstractVector{Float64},
                           z::AbstractVector{Float64}, m::AbstractVector{Float64},
-                          leaf_capacity::Integer, max_depth::Integer)
-    t = Tree(dom)
+                          leaf_capacity::Integer, max_depth::Integer,
+                          prev::Union{Nothing,Tree}=nothing)
+    t = recycle_tree(prev, dom)
     n = length(keys)
     n == 0 && return t
     depth = min(Int(max_depth), MAX_LEVEL)
@@ -144,7 +234,7 @@ function build_local_tree(dom::Domain, keys::AbstractVector{UInt64},
     reserve_nodes!(t, max(8, cld(3 * n, 2 * max(Int(leaf_capacity), 1))))
     root = push_node!(t, ROOT_KEY, 0)
     _build!(t, root, keys, x, y, z, m, 1, n, Int(leaf_capacity), depth)
-    return t
+    return pack_hot!(t)
 end
 
 function _build!(t::Tree, node::Int, keys, x, y, z, m, lo::Int, hi::Int,
@@ -249,6 +339,41 @@ function subtree_counts(t::Tree)
 end
 
 """
+    RangeCounts(tree)
+
+Subtree particle counts of a local tree, computed on demand. Each node covers a
+contiguous run of the sorted particles, so its count follows from its leftmost
+and rightmost leaf. `branch_nodes` needs only the frontier's counts, which makes
+this much cheaper than `subtree_counts` over every node. Not valid for a tree
+with imported nodes.
+"""
+struct RangeCounts <: AbstractVector{Int32}
+    t::Tree
+end
+Base.size(r::RangeCounts) = (nnodes(r.t),)
+Base.IndexStyle(::Type{RangeCounts}) = IndexLinear()
+function Base.getindex(r::RangeCounts, nd::Int)
+    t = r.t
+    lo = nd
+    while t.nchild[lo] != 0
+        oct = 0
+        while child(t, lo, oct) == 0
+            oct += 1
+        end
+        lo = Int(child(t, lo, oct))
+    end
+    hi = nd
+    while t.nchild[hi] != 0
+        oct = 7
+        while child(t, hi, oct) == 0
+            oct -= 1
+        end
+        hi = Int(child(t, hi, oct))
+    end
+    return Int32(t.lfirst[hi] + t.lcount[hi] - t.lfirst[lo])
+end
+
+"""
     branch_nodes(tree; max_branches) -> Vector{Int}
 
 A cut through the local tree with at most `max_branches` cells that together
@@ -264,9 +389,11 @@ branch_nodes(t::Tree; max_branches::Integer=128) =
 
 The frontier, given subtree counts that have already been computed.
 """
-function branch_nodes(t::Tree, cnt::Vector{Int32}; max_branches::Integer=128)
+function branch_nodes(t::Tree, cnt::AbstractVector{Int32}; max_branches::Integer=128)
     nnodes(t) == 0 && return Int[]
     frontier = [1]
+    # Counts of the frontier nodes, read once when they join it.
+    fcnt = Int32[cnt[1]]
     while length(frontier) < max_branches
         best = 0
         bestcnt = Int32(-1)
@@ -276,7 +403,7 @@ function branch_nodes(t::Tree, cnt::Vector{Int32}; max_branches::Integer=128)
             kids = Int(t.nchild[nd])
             kids == 0 && continue
             length(frontier) - 1 + kids > max_branches && continue
-            c = cnt[nd]
+            c = fcnt[slot]
             if c > bestcnt || (c == bestcnt && t.key[nd] < bestkey)
                 best = slot; bestcnt = c; bestkey = t.key[nd]; bestkids = kids
             end
@@ -284,9 +411,10 @@ function branch_nodes(t::Tree, cnt::Vector{Int32}; max_branches::Integer=128)
         best == 0 && break
         nd = frontier[best]
         deleteat!(frontier, best)
+        deleteat!(fcnt, best)
         for oct in 0:7
             c = child(t, nd, oct)
-            c != 0 && push!(frontier, Int(c))
+            c != 0 && (push!(frontier, Int(c)); push!(fcnt, cnt[Int(c)]))
         end
     end
     sort!(frontier; by=nd -> t.key[nd])
@@ -296,7 +424,7 @@ end
 function summarize_partition(t::Tree, owner::Integer, box::Box, npart::Integer,
                              x::AbstractVector{Float64}, y::AbstractVector{Float64},
                              z::AbstractVector{Float64}; max_branches::Integer=128)
-    counts = subtree_counts(t)
+    counts = nimported(t) == 0 ? RangeCounts(t) : subtree_counts(t)
     nds = branch_nodes(t, counts; max_branches)
     # The branch nodes are a cut of the tree in key order and the particles are
     # in Morton order, so each branch owns a contiguous run and the runs follow
@@ -723,8 +851,8 @@ with the cell-level opening criterion.
 """
 function assemble_let(ct::CoarseTree, local_tree::Tree, bundles::Vector{Bundle},
                       cells::Vector{Box}, branch_keys::Vector{UInt64}, theta::Float64,
-                      self::Integer=0)
-    t = Tree(ct.dom)
+                      self::Integer=0; prev::Union{Nothing,Tree}=nothing)
+    t = recycle_tree(prev, ct.dom)
     theta2 = theta * theta
 
     nbundle = sum(bundle_nnodes, bundles; init=0)
@@ -760,7 +888,7 @@ function assemble_let(ct::CoarseTree, local_tree::Tree, bundles::Vector{Bundle},
     root = push_node!(t, ROOT_KEY, 0)
     gx, gy, gz, _ = cell_geometry(ct.dom, ROOT_KEY)
     _emit_let!(t, root, ROOT_KEY, gx, gy, gz, ct, ms, bundles, cells, theta2)
-    return t
+    return pack_hot!(t)
 end
 
 "Reserve capacity for `n` nodes without creating them."

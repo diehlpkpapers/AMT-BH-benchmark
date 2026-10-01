@@ -99,6 +99,86 @@ end
     end
 end
 
+@testset "the staged build packs, counts and recycles like the serial path" begin
+    # Per-task packing, range-based subtree counts and recycled arrays must give
+    # exactly what the plain path gives.
+    rng = MersenneTwister(7)
+    n = 20_000
+    bs = n
+    buf = zeros(N.NFIELD * bs)
+    meta = zeros(UInt64, N.NMETA * bs)
+    p = N.pfields(buf, bs, n)
+    # Clustered, so the planner has to split unevenly.
+    for i in 1:n
+        c = i % 5 == 0 ? 0.0 : 3.0
+        p.x[i] = c + randn(rng); p.y[i] = randn(rng) * 0.2; p.z[i] = randn(rng) * 0.05
+        p.m[i] = 1.0 + rand(rng)
+    end
+    key = N.mview(meta, bs, N.M_KEY, n)
+    id = N.mview(meta, bs, N.M_ID, n)
+    id .= 1:n
+    dom = N.bounding_domain((minimum(p.x), minimum(p.y), minimum(p.z)),
+                            (maximum(p.x), maximum(p.y), maximum(p.z)))
+    N.compute_keys!(key, dom, p.x, p.y, p.z)
+    N.sort_partition!(key, id, p.m, p.x, p.y, p.z, p.vx, p.vy, p.vz)
+
+    function staged(ntask, leaf, prev)
+        plan = N.task_tree_plan(buf, meta, bs, n, dom, leaf, N.MAX_LEVEL, ntask, prev)
+        counts = [N.task_tree_count(buf, meta, bs, n, dom, leaf, N.MAX_LEVEL, plan, k)
+                  for k in 1:ntask]
+        off = N.task_tree_offsets(plan, counts...)
+        tree = N.task_tree_reserve(plan, off, counts...)
+        # Reverse order: the fill tasks must not depend on running in sequence.
+        for k in ntask:-1:1
+            N.task_tree_fill!(tree, buf, meta, bs, n, leaf, N.MAX_LEVEL, plan, off, k)
+        end
+        return N.task_tree_finish!(tree, plan, off)
+    end
+    fields(t) = (t.key, t.level, t.mass, t.comx, t.comy, t.comz, t.size, t.childflat,
+                 t.nchild, t.lfirst, t.lcount, t.hot, t.kids)
+
+    for leaf in (1, 4), ntask in (2, 5, 16)
+        t = staged(ntask, leaf, nothing)
+        hot = copy(t.hot); kids = copy(t.kids)
+        empty!(t.hot); empty!(t.kids)
+        N.pack_hot!(t)
+        @test t.hot == hot
+        @test t.kids == kids
+
+        cnt = N.subtree_counts(t)
+        @test N.RangeCounts(t) == cnt
+        @test N.branch_nodes(t, N.RangeCounts(t); max_branches=64) ==
+              N.branch_nodes(t, cnt; max_branches=64)
+
+        # Built again in its own arrays, and in a tree from a different build.
+        fresh = fields(staged(ntask, leaf, nothing))
+        @test fields(staged(ntask, leaf, t)) == fresh
+        other = N.build_local_tree(dom, key, p.x, p.y, p.z, p.m, 2, N.MAX_LEVEL)
+        @test fields(staged(ntask, leaf, other)) == fresh
+    end
+    serial = N.build_local_tree(dom, key, p.x, p.y, p.z, p.m, 1, N.MAX_LEVEL)
+    @test fields(N.build_local_tree(dom, key, p.x, p.y, p.z, p.m, 1, N.MAX_LEVEL,
+                                    staged(8, 4, nothing))) == fields(serial)
+end
+
+@testset "the move pass has its own granularity" begin
+    cfg = Config()
+    cfg.max_tiles = 256
+    small = N.Layout(Dagger.Processor[], Vector{Dagger.Processor}[], 1, 4)
+    big = N.Layout(Dagger.Processor[], Vector{Dagger.Processor}[], 1, 192)
+    # Where the driver cost is small, the walk's oversubscription is kept...
+    @test N.move_tile_count(cfg, small, 4_000_000) == N.tile_count(cfg, small, 4_000_000)
+    # ...and where it is not, far fewer tasks than the walk's tiles.
+    @test N.move_tile_count(cfg, big, 4_000_000) ==
+          4_000_000 ÷ (N.MOVE_PARTICLES_PER_PROC * 192)
+    @test N.move_tile_count(cfg, big, 4_000_000) < N.tile_count(cfg, big, 4_000_000)
+    @test N.move_tile_count(cfg, big, 1_000) == 1
+    cfg.move_tiles = 0
+    @test N.move_tile_count(cfg, big, 4_000_000) == N.tile_count(cfg, big, 4_000_000)
+    cfg.move_tiles = 7
+    @test N.move_tile_count(cfg, big, 4_000_000) == 7
+end
+
 # ---------------------------------------------------------------------------
 # Physics oracles.
 #
@@ -185,6 +265,20 @@ end
     pts = [(4 * rand(rng) - 2, 2 * rand(rng) - 1, 8 * rand(rng) - 3) for _ in 1:500]
     keys = [N.morton_key(dom, p...) for p in pts]
     @test issorted(sort(keys))
+    # The bit-spread key must equal the sentinel followed by one octant digit per
+    # level, also for points outside the domain.
+    digits(x, y, z, level) = begin
+        ix, iy, iz = N.cell_index(dom, x, y, z, level)
+        k = N.ROOT_KEY
+        for l in (level - 1):-1:0
+            k = (k << 3) | UInt64(N.octant(ix, iy, iz, l))
+        end
+        k
+    end
+    for _ in 1:2000, level in (0, 1, 7, N.MAX_LEVEL)
+        x, y, z = 8 * rand(rng) - 3, 4 * rand(rng) - 2, 10 * rand(rng) - 4
+        @test N.morton_key(dom, x, y, z, level) == digits(x, y, z, level)
+    end
 end
 
 @testset "theta = 0 reproduces brute force exactly" begin
@@ -409,6 +503,95 @@ end
     # Positions must have moved -- a test that passes on a frozen state is no test.
     c, _ = run_sim(args; steps=0)
     @test !(a.x ≈ c.x)
+end
+
+@testset "the predicted domain is the box the particles end up in" begin
+    # Computed before the kick and drift, it must predict them exactly, on the
+    # first step (half kick) and on the fused steps after it (whole kick).
+    cfg = parse_config(["--generate=3000", "--generate_kind=collision", "--quiet=true",
+                        "--energy_interval=0", "--move_tiles=3"])
+    N.setup_backend!(cfg)
+    s = N.prepare(cfg)
+    for step in 1:4
+        N.step!(s, cfg.dt; sync=false, want_pot=false)
+        ps, = N.gather_state(s)
+        @test N.particle_box(ps.x, ps.y, ps.z) == s.boxes[1]
+    end
+end
+
+@testset "the packet walk is the scalar walk" begin
+    # Bit-identical to the scalar walk, with one partition and with two (imports
+    # and summary nodes in the LET).
+    base = ["--generate=6000", "--generate_kind=collision", "--theta=0.5",
+            "--leaf_capacity=1", "--quiet=true", "--energy_interval=0"]
+    for workers in (0, NWORKERS)
+        ref, sref = run_sim([base; "--workers=$workers"; "--simd_lanes=0"]; steps=2)
+        sref.reduced = collect(sref.red)
+        for lanes in (4, 8, 16, 32)
+            got, sgot = run_sim([base; "--workers=$workers"; "--simd_lanes=$lanes"]; steps=2)
+            sgot.reduced = collect(sgot.red)
+            for f in (:x, :y, :z, :vx, :vy, :vz, :ax, :ay, :az, :pot)
+                @test getfield(got, f) == getfield(ref, f)
+            end
+            @test N.reduced_sum(sgot, N.RED_DIRECT) == N.reduced_sum(sref, N.RED_DIRECT)
+            @test N.reduced_sum(sgot, N.RED_APPROX) == N.reduced_sum(sref, N.RED_APPROX)
+        end
+    end
+end
+
+@testset "the packet walk does not allocate" begin
+    # Allocation per particle would not change the result, but every collection
+    # stops all threads, so it would stop the walk from scaling.
+    rng = MersenneTwister(9)
+    n = 5000
+    x = randn(rng, n); y = randn(rng, n); z = randn(rng, n); m = rand(rng, n) .+ 1
+    vx = zeros(n); vy = zeros(n); vz = zeros(n); id = collect(1:n)
+    dom = N.bounding_domain((minimum(x), minimum(y), minimum(z)), (maximum(x), maximum(y), maximum(z)))
+    key = Vector{UInt64}(undef, n); N.compute_keys!(key, dom, x, y, z)
+    N.sort_partition!(key, id, m, x, y, z, vx, vy, vz)
+    t = N.build_local_tree(dom, key, x, y, z, m, 1, N.MAX_LEVEL)
+    ax = zeros(n); ay = zeros(n); az = zeros(n); pot = zeros(n)
+    p = N.PhysicsParams(1.0, 1e-3, 0.5, false)
+    walk(lanes, potv) = N.traverse_batch!(ax, ay, az, pot, t, 1:n, x, y, z, m, id, key, p,
+                                          N.InteractionCounts(), Int32[], potv,
+                                          Val(false), Val(false), lanes)
+    for lanes in (Val(4), Val(8), Val(16), Val(32)), potv in (Val(false), Val(true))
+        walk(lanes, potv)
+        # A per-particle allocation would be megabytes here.  The bound leaves
+        # room for the ~1 KB per call that `Pkg.test`'s forced bounds checks add.
+        @test (@allocated walk(lanes, potv)) < 16_384
+    end
+end
+
+@testset "the radix permutation is the stable sort's" begin
+    rng = MersenneTwister(5)
+    for n in (0, 1, 1023, 1024, 5000, 100_000)
+        # Wide keys, narrow keys (few digits differ) and many duplicates.
+        for keys in (rand(rng, UInt64, n),
+                     (UInt64(1) << 63) .| rand(rng, UInt64(0):UInt64(1 << 20), n),
+                     rand(rng, UInt64(7):UInt64(12), n))
+            @test N.key_sortperm(keys) == sortperm(keys; alg = Base.Sort.DEFAULT_STABLE)
+        end
+    end
+end
+
+@testset "the sample sort is the serial sort" begin
+    # Forced with --sort_tiles: at test sizes the default never picks it.  Needs
+    # four threads.
+    if Threads.nthreads() < 4
+        @info "sample sort test skipped: needs --threads=4 or more"
+    else
+        common = ["--generate=20000", "--theta=0.5", "--leaf_capacity=4",
+                  "--quiet=true", "--sort_tiles=4", "--energy_interval=0"]
+        run(extra) = first(run_sim([common; extra]; steps=3))
+        serial = run(["--parallel_sort=false"])
+        for extra in (["--reuse_splitters=false"], ["--reuse_splitters=true"])
+            got = run(extra)
+            for f in (:id, :x, :y, :z, :vx, :vy, :vz, :ax, :ay, :az)
+                @test getfield(got, f) == getfield(serial, f)
+            end
+        end
+    end
 end
 
 @testset "result is independent of the tile count" begin

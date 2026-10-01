@@ -54,21 +54,22 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    task_post_drift_box(buf, bs, n, dt) -> (Box, count, mass)
+    task_post_drift_box(buf, bs, n, dt, kick_h, lo, hi) -> (Box, count, mass)
 
-Bounding box the partition *will* have after this step's kick and drift,
-computed exactly as `x + (v + a dt/2) dt`.  Computing it before the update lets
-the kick, the drift, the Morton keys and the local sort share a single Datadeps
-region: the keys need the global domain, and the domain needs the post-drift
+Bounding box particles `lo:hi` *will* have after this step's kick and drift,
+computed exactly as `task_move!` will move them: `x + (v + a kick_h) dt`.
+Computing it before the update lets the kick, the drift, the Morton keys and the
+sort run in one pass: the keys need the global domain, and the domain needs the
+post-drift extent.
 """
-function task_post_drift_box(buf, bs::Int, n::Int, dt::Float64)::PartitionExtent
-    n == 0 && return (EMPTY_BOX, 0, 0.0)
+function task_post_drift_box(buf, bs::Int, n::Int, dt::Float64, h::Float64,
+                             lo::Int, hi::Int)::PartitionExtent
+    (n == 0 || hi < lo) && return (EMPTY_BOX, 0, 0.0)
     p = pfields(buf, bs, n)
-    h = 0.5 * dt
     xlo = ylo = zlo = Inf
     xhi = yhi = zhi = -Inf
     mass = 0.0
-    @inbounds for i in 1:n
+    @inbounds for i in lo:hi
         xi = p.x[i] + (p.vx[i] + p.ax[i] * h) * dt
         yi = p.y[i] + (p.vy[i] + p.ay[i] * h) * dt
         zi = p.z[i] + (p.vz[i] + p.az[i] * h) * dt
@@ -77,8 +78,9 @@ function task_post_drift_box(buf, bs::Int, n::Int, dt::Float64)::PartitionExtent
         zlo = min(zlo, zi); zhi = max(zhi, zi)
         mass += p.m[i]
     end
-    return (Box(xlo, ylo, zlo, xhi, yhi, zhi), n, mass)
+    return (Box(xlo, ylo, zlo, xhi, yhi, zhi), hi - lo + 1, mass)
 end
+
 
 """
 Per-partition value gathered by a pure task: bounding box, particle count and
@@ -89,6 +91,19 @@ know the task's result type without asking the other ranks -- see the
 const PartitionExtent = Tuple{Box,Int,Float64}
 
 gather_extents(v...)::Vector{PartitionExtent} = collect(v)
+"The extents of a partition's tiles, combined into the partition's own."
+function task_merge_extents(xs::PartitionExtent...)::PartitionExtent
+    box = EMPTY_BOX
+    cnt = 0
+    mass = 0.0
+    for (b, c, m) in xs
+        box = box_union(box, b)
+        cnt += c
+        mass += m
+    end
+    return (box, cnt, mass)
+end
+
 """
     collect_summaries(summaries) -> Vector{PartitionSummary}
 
@@ -124,6 +139,19 @@ function task_move!(buf, meta, bs::Int, n::Int, dom::Domain, dt::Float64,
 end
 
 """
+    task_move_count!(buf, meta, bs, n, dom, dt, kick_h, lo, hi, splitters) -> Vector{Int}
+
+`task_move!` for one tile, then the sample sort's count of its particles per
+bucket, which saves the sort a stage.
+"""
+function task_move_count!(buf, meta, bs::Int, n::Int, dom::Domain, dt::Float64,
+                          kick_h::Float64, lo::Int, hi::Int,
+                          splitters::Vector{UInt64})::Vector{Int}
+    task_move!(buf, meta, bs, n, dom, dt, kick_h, lo, hi)
+    return task_sort_count(meta, bs, n, lo, hi, splitters)
+end
+
+"""
     task_sort!(buf, meta, bs, n)
 
 Re-sort a partition into Morton order after `task_move!` has re-keyed it.
@@ -138,10 +166,11 @@ function task_sort!(buf, meta, bs::Int, n::Int)::Nothing
 end
 
 function task_build_tree(buf, meta, bs::Int, n::Int, dom::Domain,
-                         leaf_capacity::Int, max_depth::Int)::Tree
+                         leaf_capacity::Int, max_depth::Int,
+                         prev::Union{Nothing,Tree}=nothing)::Tree
     p = pfields(buf, bs, n)
     key = mview(meta, bs, M_KEY, n)
-    return build_local_tree(dom, key, p.x, p.y, p.z, p.m, leaf_capacity, max_depth)
+    return build_local_tree(dom, key, p.x, p.y, p.z, p.m, leaf_capacity, max_depth, prev)
 end
 
 
@@ -160,15 +189,17 @@ end
 
 task_merge_bundles(bundles...)::Bundle = merge_bundles(Bundle[bundles...])
 
-task_assemble_let(tree, ct, cells, branch_keys, theta, self::Int, bundles...)::Tree =
-    assemble_let(ct, tree, Bundle[bundles...], cells, branch_keys, theta, self)
+task_assemble_let(tree, ct, cells, branch_keys, theta, self::Int,
+                  prev::Union{Nothing,Tree}, bundles...)::Tree =
+    assemble_let(ct, tree, Bundle[bundles...], cells, branch_keys, theta, self; prev)
 
 # `reset` is true for the first batch of a partition: the batches of one
 # partition are serialised on their own chunks anyway, so zeroing the counters
 # here saves a separate Datadeps task.  `_after` is ignored; it exists only to
 # order one batch after the previous batch of the same partition.
 function task_forces!(buf, red, meta, bs::Int, n::Int, tree, lo::Int, hi::Int,
-                      params::PhysicsParams, rowoff::Int)::Nothing
+                      params::PhysicsParams, rowoff::Int, want_pot::Bool,
+                      fastmath::Bool, compact_children::Bool, simd_lanes::Int)::Nothing
     # Every tile owns its own group of `NRED` rows and writes its own particle
     # range, so the tiles are disjoint and need no ordering between them.  Only
     # tile 1 records the tree sizes, which are per partition.
@@ -182,8 +213,20 @@ function task_forces!(buf, red, meta, bs::Int, n::Int, tree, lo::Int, hi::Int,
     id = mview(meta, bs, M_ID, n)
     key = mview(meta, bs, M_KEY, n)
     counts = InteractionCounts()
-    traverse_batch!(p.ax, p.ay, p.az, p.pot, tree, lo:hi, p.x, p.y, p.z, p.m, id,
-                    key, params, counts, Int32[])
+    # Two call sites rather than a runtime flag: `Val` makes the potential a
+    # compile-time constant, so the branch and its reciprocal square root fold
+    # out of the inner loop.
+    fast = fastmath ? Val(true) : Val(false)
+    compact = compact_children ? Val(true) : Val(false)
+    lanes = simd_lanes == 32 ? Val(32) : simd_lanes == 16 ? Val(16) : simd_lanes == 8 ? Val(8) :
+            simd_lanes == 4 ? Val(4) : simd_lanes == 2 ? Val(2) : Val(0)
+    if want_pot
+        traverse_batch!(p.ax, p.ay, p.az, p.pot, tree, lo:hi, p.x, p.y, p.z, p.m, id,
+                        key, params, counts, Int32[], Val(true), fast, compact, lanes)
+    else
+        traverse_batch!(p.ax, p.ay, p.az, p.pot, tree, lo:hi, p.x, p.y, p.z, p.m, id,
+                        key, params, counts, Int32[], Val(false), fast, compact, lanes)
+    end
     red[rowoff + RED_DIRECT, 1] += counts.direct
     red[rowoff + RED_APPROX, 1] += counts.approx
     return nothing
@@ -275,6 +318,8 @@ mutable struct Sim
     ntile::Int                  # tiles per partition, adapted at run time
     last_spawn::Float64         # driver time of the last interaction phase
     last_wait::Float64          # worker time of the last interaction phase
+    # Per partition: the sample sort's splitters for the next step.
+    splitters::Vector{Any}
 end
 
 partition_size(s::Sim, i::Int) = clamp(s.n - (i - 1) * s.bs, 0, s.bs)
@@ -385,7 +430,7 @@ function build_sim(cfg::Config, ps::ParticleSet)
                build_coarse_tree(dom, PartitionSummary[]),
                Vector{Any}(undef, p), Vector{Any}(undef, p),
                Tuple{Int,String}[], Float64[], String[], 0.0, 0, Float64[], true,
-               ntile, 0.0, 0.0)
+               ntile, 0.0, 0.0, Vector{Any}(undef, p))
 end
 
 "Record which process and processor each partition's work actually runs on."
@@ -411,13 +456,28 @@ tasks, gathered by a single Dagger task and fetched once, so every process ends
 up with the same domain -- and the same subsequent task graph -- without any
 explicit communication.
 """
-function update_domain!(s::Sim, dt::Float64)
-    ts = [Dagger.@spawn scope=partition_scope(s, i) return_type=PartitionExtent task_post_drift_box(
-              chunk(s.buf, i), s.bs, partition_size(s, i), dt) for i in 1:s.p]
+function update_domain!(s::Sim, dt::Float64; kick_h::Float64=dt / 2)
+    # Tiled like the move pass. The tiles' extents are merged on the driver, so
+    # no extra stage sits in front of the step; under MPI, where a fetch is a
+    # collective, one gather task per partition does it instead.
+    mpi = s.cfg.backend === :mpi
+    ts = Vector{Any}(undef, s.p)
+    for i in 1:s.p
+        n = partition_size(s, i)
+        sc = partition_scope(s, i)
+        k = move_tile_count(s.cfg, s.lay, n)
+        parts = [Dagger.@spawn scope=sc return_type=PartitionExtent task_post_drift_box(
+                     chunk(s.buf, i), s.bs, n, dt, kick_h, first(r), last(r))
+                 for r in tiles(max(n, 1), k)]
+        ts[i] = !mpi ? parts :
+                length(parts) == 1 ? parts[1] :
+                Dagger.@spawn(scope=sc, return_type=PartitionExtent, task_merge_extents(parts...))
+    end
     # Same reasoning as `collect_summaries`, including the MPI split.
-    parts = s.cfg.backend === :mpi ?
+    parts = mpi ?
         fetch(Dagger.@spawn task_gather_extents(ts...)) :
-        PartitionExtent[fetch(t) for t in ts]
+        PartitionExtent[t isa Vector ? task_merge_extents(map(fetch, t)...) : fetch(t)
+                        for t in ts]
     lo = (Inf, Inf, Inf)
     hi = (-Inf, -Inf, -Inf)
     for i in 1:s.p
@@ -439,15 +499,35 @@ function advance_partitions!(s::Sim, dt::Float64; kick_h::Float64=dt / 2)
     bs = s.bs
     # Kick, drift and re-key are elementwise in the particle index and tile like
     # the force walk: disjoint ranges, no ordering, no Datadeps region.  The sort
-    # is not elementwise and stays one task per partition, which is why the two
-    # are separate stages with a wait between them.
+    # is not elementwise, which is why the two are separate stages with a wait
+    # between them.  Where the sample sort runs, the move tasks also count its
+    # buckets, against splitters from the previous step's sorted keys; that saves
+    # the sort two stages, and stale splitters only affect how evenly the buckets
+    # fill, never the order.
+    fused = Vector{Any}(nothing, s.p)
     phase!(s.tm, "integ.move") do
         moves = Any[]
         for i in 1:s.p
             n = partition_size(s, i)
             n == 0 && continue
-            for (t, r) in enumerate(partition_tiles(s, i))
-                push!(moves, Dagger.@spawn scope=partition_scope(s, i) return_type=Nothing task_move!(
+            sc = partition_scope(s, i)
+            k = sort_tile_count(s.cfg, s.lay, n)
+            if s.cfg.reuse_splitters && uses_sample_sort(s, n, k)
+                # The first step samples them from the current keys.
+                sp = isassigned(s.splitters, i) ? s.splitters[i] :
+                     Dagger.@spawn scope=sc return_type=Vector{UInt64} task_sort_splitters(
+                         chunk(s.meta, i), bs, n, k)
+                counts = [Dagger.@spawn scope=sc return_type=Vector{Int} task_move_count!(
+                              chunk(s.buf, i), chunk(s.meta, i), bs, n, dom, dt, kick_h,
+                              first(r), last(r), sp)
+                          for r in tiles(n, k)]
+                fused[i] = (sp, counts)
+                append!(moves, counts)
+                continue
+            end
+            # Its own granularity, not the walk's: see `move_tile_count`.
+            for r in tiles(n, move_tile_count(s.cfg, s.lay, n))
+                push!(moves, Dagger.@spawn scope=sc return_type=Nothing task_move!(
                     chunk(s.buf, i), chunk(s.meta, i), bs, n, dom, dt, kick_h,
                     first(r), last(r)))
             end
@@ -457,39 +537,45 @@ function advance_partitions!(s::Sim, dt::Float64; kick_h::Float64=dt / 2)
         foreach(wait, moves)
     end
     phase!(s.tm, "integ.sort") do
-        sort_partitions!(s)
+        sort_partitions!(s, fused)
     end
     return nothing
 end
+
+"Whether partition `n` is sorted by the sample sort at `k` buckets, or by one task."
+uses_sample_sort(s::Sim, n::Int, k::Int) =
+    s.cfg.parallel_sort && k > 1 && n > 1 && s.lay.nthreads >= 4
 
 """
     sort_partitions!(s)
 
 Put every partition back into Morton order, in parallel.
 """
-function sort_partitions!(s::Sim)
+function sort_partitions!(s::Sim, fused::Vector{Any}=Vector{Any}(nothing, s.p))
     bs = s.bs
     pending = Any[]
     for i in 1:s.p
         n = partition_size(s, i)
         n == 0 && continue
-        tl = partition_tiles(s, i)
-        k = length(tl)
+        # `sort_tile_count`, not the walk's tiles: a sort stage is one pass over
+        # its slice, far less work than a walk tile.
+        k = sort_tile_count(s.cfg, s.lay, n)
+        tl = tiles(n, k)
         sc = partition_scope(s, i)
-        # Off by default.  The sample sort wins on a few threads but loses badly at
-        # high core counts: it costs `3k+4` tasks per partition per step against one,
-        # and the driver is charged per task at a rate that grows with the processor
-        # count.
-        if !s.cfg.parallel_sort || k <= 1 || n <= 1 || s.lay.nthreads < 4
+        if !uses_sample_sort(s, n, k)
             push!(pending, Dagger.@spawn scope=sc return_type=Nothing task_sort!(
                 chunk(s.buf, i), chunk(s.meta, i), bs, n))
             continue
         end
-        sp = Dagger.@spawn scope=sc return_type=Vector{UInt64} task_sort_splitters(
-            chunk(s.meta, i), bs, n, k)
-        counts = [Dagger.@spawn scope=sc return_type=Vector{Int} task_sort_count(
-                      chunk(s.meta, i), bs, n, first(r), last(r), sp)
-                  for r in tl]
+        if fused[i] === nothing
+            sp = Dagger.@spawn scope=sc return_type=Vector{UInt64} task_sort_splitters(
+                chunk(s.meta, i), bs, n, k)
+            counts = [Dagger.@spawn scope=sc return_type=Vector{Int} task_sort_count(
+                          chunk(s.meta, i), bs, n, first(r), last(r), sp)
+                      for r in tl]
+        else
+            sp, counts = fused[i]            # counted by the move tasks
+        end
         dest = Dagger.@spawn scope=sc return_type=Vector{Int} task_sort_place(counts...)
         totals = Dagger.@spawn scope=sc return_type=Vector{Int} task_sort_totals(counts...)
         scatters = [Dagger.@spawn scope=sc return_type=Nothing task_sort_scatter!(
@@ -508,6 +594,15 @@ function sort_partitions!(s::Sim)
         end
     end
     foreach(wait, pending)
+    # Next step's splitters, from the keys just sorted.  This runs alongside the
+    # tree build, which only reads the keys; the next move tasks take it as an
+    # argument.
+    for i in 1:s.p
+        fused[i] === nothing && continue
+        n = partition_size(s, i)
+        s.splitters[i] = Dagger.@spawn scope=partition_scope(s, i) return_type=Vector{UInt64} task_sort_splitters(
+            chunk(s.meta, i), bs, n, sort_tile_count(s.cfg, s.lay, n))
+    end
     return nothing
 end
 
@@ -525,24 +620,32 @@ function spawn_tree(s::Sim, i::Int)
     # count pass adds about a third to the total work -- so a plain one-task-per-
     # thread rule would pick it exactly where the phase should start scaling.
     # The floor must not apply at one thread, where the decomposition is pure
-    # overhead and the single-thread point is the speedup baseline.
+    # overhead and the single-thread point is the speedup baseline.  More than
+    # sixteen tasks measured no faster.
     thr = max(s.lay.nthreads, 1)
     ntask = cfg.tree_tasks > 0 ? cfg.tree_tasks :
             thr == 1 ? 1 : clamp(thr, 4, 16)
     ntask = min(ntask, max(np, 1))
     sc = partition_scope(s, i)
+    # Last step's tree, whose arrays this one reuses (`recycle_tree`).  The first
+    # build gets an empty tree rather than `nothing`, so the warm-up step compiles
+    # the same method as every later step.
+    prev = !cfg.recycle_trees ? nothing :
+           isassigned(s.trees, i) ? s.trees[i] :
+           Dagger.@spawn scope=sc return_type=Tree Tree(s.dom)
     if ntask <= 1 || np == 0
         return Dagger.@spawn scope=sc return_type=Tree task_build_tree(
             chunk(s.buf, i), chunk(s.meta, i), s.bs, np, s.dom,
-            cfg.leaf_capacity, cfg.max_depth)
+            cfg.leaf_capacity, cfg.max_depth, prev)
     end
     # Five stages, and no copy anywhere:
     #
     #   plan     split the particle range by work, group the pieces into tasks
     #   count    how many nodes each piece will need   (parallel)
-    #   reserve  grow one node array to the final size
-    #   fill     build the pieces straight into it     (parallel, disjoint ranges)
-    #   finish   centres of mass for the nodes above the split
+    #   layout   offsets of every piece, and grow one node array to the final size
+    #   fill     build the pieces straight into it     (parallel, disjoint ranges),
+    #            and pack each piece for the walk
+    #   finish   centres of mass and packing for the nodes above the split
     #
     # Counting first is what removes the copy: one extra pass over the keys, no
     # allocation, no writes.  `count` and `fill` take the plan, and `fill` the
@@ -550,18 +653,17 @@ function spawn_tree(s::Sim, i::Int)
     # pulls anything back between stages.
     plan = Dagger.@spawn scope=sc return_type=TreePlan task_tree_plan(
         chunk(s.buf, i), chunk(s.meta, i), s.bs, np, s.dom,
-        cfg.leaf_capacity, cfg.max_depth, ntask)
-    counts = [Dagger.@spawn scope=sc return_type=Vector{Int} task_tree_count(
+        cfg.leaf_capacity, cfg.max_depth, ntask, prev)
+    counts = [Dagger.@spawn scope=sc return_type=Vector{NTuple{2,Int}} task_tree_count(
                   chunk(s.buf, i), chunk(s.meta, i), s.bs, np, s.dom,
                   cfg.leaf_capacity, cfg.max_depth, plan, k) for k in 1:ntask]
-    # `reserve` takes `off` so the runtime sequences it after `offsets`: it grows
-    # the upper tree in place, and `offsets` needs the size from before that.
-    off = Dagger.@spawn scope=sc return_type=Vector{Int} task_tree_offsets(plan, counts...)
-    tree = Dagger.@spawn scope=sc return_type=Tree task_tree_reserve(plan, off, counts...)
-    fills = [Dagger.@spawn scope=sc return_type=Nothing task_tree_fill!(
-                 tree, chunk(s.buf, i), chunk(s.meta, i), s.bs, np,
-                 cfg.leaf_capacity, cfg.max_depth, plan, off, k) for k in 1:ntask]
-    return Dagger.@spawn scope=sc return_type=Tree task_tree_finish!(tree, plan, fills...)
+    # Offsets and reserve in one task: they are strictly sequential anyway.
+    layout = Dagger.@spawn scope=sc return_type=Tuple{Tree,TreeOffsets} task_tree_layout(
+        plan, counts...)
+    fills = [Dagger.@spawn scope=sc return_type=Nothing task_tree_fill_at!(
+                 layout, chunk(s.buf, i), chunk(s.meta, i), s.bs, np,
+                 cfg.leaf_capacity, cfg.max_depth, plan, k) for k in 1:ntask]
+    return Dagger.@spawn scope=sc return_type=Tree task_tree_finish_at!(layout, plan, fills...)
 end
 
 "Local octrees plus the coarse global tree assembled from their cell summaries."
@@ -738,9 +840,13 @@ function _build_lets_plan!(s::Sim, requests)
         need = Set{Int}(Int(j) for j in import_owners(requests, i))
         imported = Any[merged[(f, g)] for f in 1:fanin
                        if haskey(merged, (f, g)) && any(in(need), omembers(f))]
+        # Reuse last step's LET, as `spawn_tree` does with the local tree.
+        prev = !s.cfg.recycle_trees ? nothing :
+               isassigned(s.lets, i) ? s.lets[i] :
+               Dagger.@spawn scope=partition_scope(s, i) return_type=Tree Tree(s.dom)
         s.lets[i] = Dagger.spawn(task_assemble_let, partition_options(s, i, Tree), s.trees[i],
                                  s.ct, s.cells[i], s.branch_keys[i], s.cfg.theta, i,
-                                 imported...)
+                                 prev, imported...)
     end
     return s.lets
 end
@@ -751,7 +857,7 @@ end
 The interaction phase: one Dagger task per batch of target particles, pinned to
 the process that owns them.
 """
-function compute_interactions!(s::Sim)
+function compute_interactions!(s::Sim, want_pot::Bool=true)
     params = s.params
     bs = s.bs
     # Two sub-phases, because they scale in opposite directions and the sum hides
@@ -767,7 +873,8 @@ function compute_interactions!(s::Sim)
             for (t, r) in enumerate(partition_tiles(s, i))
                 push!(out, Dagger.@spawn scope=partition_scope(s, i) return_type=Nothing task_forces!(
                     chunk(s.buf, i), chunk2(s.red, i), chunk(s.meta, i), bs, np,
-                    s.lets[i], first(r), last(r), params, (t - 1) * NRED))
+                    s.lets[i], first(r), last(r), params, (t - 1) * NRED, want_pot,
+                    s.cfg.fastmath, s.cfg.compact_children, s.cfg.simd_lanes))
             end
         end
         out
@@ -788,7 +895,7 @@ end
 Tree construction, LET exchange and the interaction phase: everything needed to
 turn the current positions into accelerations and potential contributions.
 """
-function update_accelerations!(s::Sim)
+function update_accelerations!(s::Sim, want_pot::Bool=true)
     tm = s.tm
     phase!(tm, "tree_construction") do
         build_trees!(s)   # ends with a collective fetch of the (small) summaries
@@ -803,7 +910,7 @@ function update_accelerations!(s::Sim)
         build_lets!(s)
     end
     phase!(tm, "particle_interactions") do
-        compute_interactions!(s)
+        compute_interactions!(s, want_pot)
     end
     if s.cfg.verify_tree
         for i in 1:s.p
@@ -834,7 +941,7 @@ One kick-drift-kick leapfrog step.  With `dt == 0` the state is unchanged,
 which is how the warm-up iterations exercise every code path (and force
 compilation) without perturbing the initial condition.
 """
-function step!(s::Sim, dt::Float64; sync::Bool=true)
+function step!(s::Sim, dt::Float64; sync::Bool=true, want_pot::Bool=true)
     t0 = time_ns()
     # Kick-drift-kick with the two half kicks either side of a step boundary
     # fused: both use the accelerations just computed, so the pair is one full
@@ -848,14 +955,14 @@ function step!(s::Sim, dt::Float64; sync::Bool=true)
     # kick / drift / re-key / sort.
     phase!(s.tm, "integration") do
         phase!(s.tm, "integ.domain") do
-            update_domain!(s, dt)
+            update_domain!(s, dt; kick_h=kick_h)
         end
         phase!(s.tm, "integ.advance") do
             advance_partitions!(s, dt; kick_h=kick_h)
         end
     end
     s.v_synced = false
-    update_accelerations!(s)
+    update_accelerations!(s, want_pot)
     if sync
         phase!(s.tm, "integration") do
             phase!(s.tm, "integ.kick") do
@@ -1103,7 +1210,12 @@ function run_simulation(cfg::Config)
         # kick and one Datadeps region disappears.
         want_energy = cfg.energy_interval > 0 && stepno % cfg.energy_interval == 0
         want_vtk = cfg.vtk_interval > 0 && stepno % cfg.vtk_interval == 0
-        step!(s, cfg.dt; sync=want_energy || want_vtk || stepno == cfg.steps)
+        # The potential is only read by `energies`, so the traversal skips it on
+        # every other step -- it is a second reciprocal square root per interaction.
+        # With energy reporting off nothing reads it, not even on the last step.
+        want_pot = want_energy || (cfg.energy_interval > 0 && stepno == cfg.steps)
+        step!(s, cfg.dt; sync=want_energy || want_vtk || stepno == cfg.steps,
+              want_pot=want_pot)
         stepno == 1 && snapshot_first_step!(tm)
         if want_energy
             ke, pe = phase!(tm, "energy") do

@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: ./run.sh [input.csv] [extra simulate.jl args...]
-# env: THREADS PROCS RANKS BACKEND STEPS WARMUP THETA LEAF DT EPS G TILES QUIET
+# env: THREADS PROCS RANKS BACKEND STEPS WARMUP THETA LEAF DT EPS G TILES SIMD_LANES QUIET
 set -e
 cd "$(dirname "$0")"
 
@@ -18,6 +18,7 @@ ARGS=(--input="$INPUT" --steps="${STEPS:-10}" --warmup_steps="${WARMUP:-1}"
 [ -n "${EPS:-}" ]   && ARGS+=(--softening="$EPS")
 [ -n "${G:-}" ]     && ARGS+=(--G="$G")
 [ -n "${TILES:-}" ] && ARGS+=(--tiles="$TILES")
+[ -n "${SIMD_LANES:-}" ] && ARGS+=(--simd_lanes="$SIMD_LANES")
 
 if [ "$BACKEND" = "mpi" ]; then
   # One rank per memory domain, THREADS threads inside each.  Inside a Slurm

@@ -25,13 +25,18 @@ Defaults to `data/collision_1000.csv`. Options via env:
 
 `THREADS` (4), `PROCS` (1), `RANKS` (2), `BACKEND` (distributed),
 `STEPS` (10), `WARMUP` (1), `THETA` (0.5), `LEAF` (16), `DT`, `EPS`, `G`,
-`TILES`, `QUIET`.
+`TILES`, `SIMD_LANES`, `QUIET`.
 
 Anything left unset keeps the program's own default; `bin/simulate.jl --help`
 lists every option.
 
 The binary prints a per-phase timing table, the relative energy drift and the
 interaction counts.
+
+The force walk processes 16 particles at a time in SIMD lanes by default,
+which suits AVX-512. On CPUs with narrower vectors fewer lanes can be faster;
+`SIMD_LANES=4` or `8` sets them (`--simd_lanes` on the command line), `0` gives
+the scalar walk. The results are the same in every case.
 
 ## Datasets
 
@@ -48,10 +53,10 @@ The measurement dataset is produced with the project's
 `data/collision_4M.json`: three galaxies with seed 20260918 — a `main` disk of
 2 080 000 bodies, an `incoming` disk of 1 280 000 on a crash orbit at 45
 degrees, and a 640 000-body `satellite` on a stable orbit. The CSV itself is
-598 MB and is not in the repository; regenerate it with
+about 610 MB and is not in the repository; regenerate it with
 
 ```shell
-python generate_data.py data/collision_4M.json
+python3 generate_data.py --config data/collision_4M.json --output collision_4M.csv
 ```
 
 ### Units
@@ -108,4 +113,11 @@ core count on one node.
 
 ```shell
 julia --project=. -e 'using Pkg; Pkg.test()'
+```
+
+The sample-sort test needs at least four threads and is skipped otherwise; to
+include it:
+
+```shell
+julia --project=. -e 'using Pkg; Pkg.test(julia_args=["--threads=4"])'
 ```

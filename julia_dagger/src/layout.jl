@@ -124,3 +124,43 @@ function tile_count(cfg::Config, lay::Layout, n::Int)
     # side of the optimum a run is on.
     return max(1, min(t * max(1, cfg.tiles_per_thread), cfg.max_tiles, n))
 end
+
+"Below this many particles a partition is sorted by one task."
+const SORT_MIN_N = 250_000
+
+"""
+    sort_tile_count(cfg, lay, n) -> Int
+
+Tasks per stage of the sample sort: one per thread, but never fewer than
+`SORT_MIN_N` particles per task. Deliberately not `tile_count` -- a sort stage is
+a single pass over its slice, far less work than a walk tile, so the walk's
+granularity would spend more on spawning than the sort saves.
+"""
+function sort_tile_count(cfg::Config, lay::Layout, n::Int)
+    cfg.sort_tiles == 0 && return tile_count(cfg, lay, n)
+    cfg.sort_tiles > 0 && return max(1, min(cfg.sort_tiles, max(1, lay.nthreads), n))
+    return max(1, min(max(1, lay.nthreads), n ÷ SORT_MIN_N))
+end
+
+"""
+Particles per task and per processor in the task's scope below which the kick /
+drift / re-key pass is not split further. The driver's cost per spawned task
+grows with the processor count, so the floor does too.
+"""
+const MOVE_PARTICLES_PER_PROC = 2000
+
+"""
+    move_tile_count(cfg, lay, n) -> Int
+
+Tasks for the kick / drift / re-key pass. Elementwise and cheap, so it is
+oversubscribed like the walk at low thread counts but capped where a task no
+longer carries enough work to pay for its own spawn. `--move_tiles=0` uses the
+walk's tiling instead.
+"""
+function move_tile_count(cfg::Config, lay::Layout, n::Int)
+    cfg.move_tiles == 0 && return tile_count(cfg, lay, n)
+    cfg.move_tiles > 0 && return max(1, min(cfg.move_tiles, n))
+    thr = max(1, lay.nthreads)
+    want = min(thr * max(1, cfg.tiles_per_thread), cfg.max_tiles)
+    return max(1, min(want, n ÷ (MOVE_PARTICLES_PER_PROC * thr), n))
+end

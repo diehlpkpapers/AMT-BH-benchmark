@@ -80,6 +80,8 @@ end
     G::Float64 = G_AU_DAY_KG
     softening::Float64 = 1e-11
     soften_potential::Bool = false
+    fastmath::Bool = false                    # relax the reciprocal square root in the force kernel
+    compact_children::Bool = false            # open cells from packed child runs, not childflat
     recenter_momentum::Bool = false
     # Barnes-Hut
     algorithm::Symbol = :barneshut            # :barneshut | :bruteforce
@@ -98,7 +100,12 @@ end
     tiles::Int = 0                            # tiles per partition; 0 == derive
     tiles_per_thread::Int = 4                 # oversubscribe tiles for balancing
     max_tiles::Int = 64                       # cap on tiles per partition
-    parallel_sort::Bool = false               # sample sort instead of one sort per partition
+    parallel_sort::Bool = true                # sample sort instead of one sort per partition
+    sort_tiles::Int = -1                      # tasks per sample-sort stage; -1 == derive, 0 == follow the tile count
+    move_tiles::Int = -1                      # tasks for kick/drift/re-key; -1 == derive, 0 == follow the tile count
+    recycle_trees::Bool = true                # build each step's tree in the previous one's arrays
+    simd_lanes::Int = 16                      # particles per SIMD packet in the walk; 0 == scalar walk
+    reuse_splitters::Bool = true              # sample-sort splitters from the previous step; count during the move
     threads::Int = 0                          # Julia threads per worker process
     use_master::Bool = true                   # process 1 owns a partition too
     check_uniformity::Bool = false
@@ -200,7 +207,25 @@ verification and reporting
                             synchronisation points so the phases can overlap
   --max_tiles=INT           cap on tiles per partition (driver cost per tile)
   --parallel_sort=BOOL      sort each partition with a sample sort across its
-                            threads; off by default, it loses on this machine
+                            threads
+  --sort_tiles=INT          tasks per sample-sort stage; -1 derives one per
+                            thread, 0 follows --max_tiles
+  --simd_lanes=INT          walk the tree for INT consecutive particles at once
+                            in SIMD lanes (4, 8, 16 or 32); 0 = one at a
+                            time. 16 suits AVX-512; fewer lanes may be faster
+                            on CPUs with narrower vectors
+  --recycle_trees=BOOL      build each step's local tree in the arrays of the
+                            previous one instead of allocating it anew
+  --reuse_splitters=BOOL    count the sample sort's buckets in the move tasks,
+                            against splitters from the previous step's keys
+  --move_tiles=INT          tasks for the kick / drift / re-key pass; -1
+                            derives it from the particle count, 0 follows
+                            --max_tiles
+  --fastmath=BOOL           relax the reciprocal square root in the force
+                            kernel; changes the last bits, check the drift
+  --compact_children=BOOL   open cells from packed child runs instead of
+                            the per-octant table; wins only once the tree
+                            outgrows the cache
   --detailed_timers=BOOL    time the individual phases
   --warmup_steps=INT        steps excluded from the reported timings
   --quiet=BOOL
@@ -327,6 +352,9 @@ function validate!(cfg::Config)
     cfg.export_groups >= 0 || error("--export_groups must be non-negative")
     cfg.import_fanin >= 0 || error("--import_fanin must be non-negative")
     cfg.task_batch_size >= 0 || error("--task_batch_size must be non-negative")
+    cfg.sort_tiles >= -1 || error("--sort_tiles must be -1 (derive), 0 (follow --max_tiles) or positive")
+    cfg.move_tiles >= -1 || error("--move_tiles must be -1 (derive), 0 (follow --max_tiles) or positive")
+    cfg.simd_lanes in (0, 1, 2, 4, 8, 16, 32) || error("--simd_lanes must be 0, 1, 2, 4, 8, 16 or 32")
     cfg.backend in (:distributed, :mpi) ||
         error("--backend must be distributed or mpi")
     cfg.algorithm in (:barneshut, :bruteforce) ||
